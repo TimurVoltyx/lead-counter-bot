@@ -1,12 +1,15 @@
-# Lead-counter bot: отчёты 08-16, 16-20, 20-08 (ночь), + шутливое напоминание
+# Lead-counter bot: отчёты 08-16, 16-20, 20-08 (ночь) + шутка, + /summary
 import asyncio, re, os, aiosqlite, pytz, random
 from datetime import datetime, time, timedelta
 from telegram import Update
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes, AIORateLimiter
+from telegram.ext import (
+    Application, MessageHandler, CommandHandler,
+    filters, ContextTypes, AIORateLimiter
+)
 
 # ---- переменные окружения ----
 TOKEN   = os.getenv("BOT_TOKEN")
-CHAT_ID = int(os.getenv("CHAT_ID", "0"))
+CHAT_ID = int(os.getenv("CHAT_ID", "0"))  # например -1002485440713
 TZ      = pytz.timezone(os.getenv("TIMEZONE", "America/Los_Angeles"))
 DB = "counts.sqlite3"
 
@@ -123,62 +126,8 @@ async def send_08(ctx: ContextTypes.DEFAULT_TYPE):
     await ctx.bot.send_message(CHAT_ID, await summary_for("20-08", date_key))
     await send_joke(ctx)
 
-# --- команда /summary для ручной сводки ---
+# --- команда /summary ---
 def last_window_and_date(dt: datetime) -> tuple[str, str]:
     t = dt.time()
-    if t < time(8,0):           # 00:00–07:59 → последняя была ночь 20-08 (вчера)
-        return "20-08", (dt.date() - timedelta(days=1)).strftime("%Y-%m-%d")
-    if t < time(16,0):          # 08:00–15:59 → последняя 08-16 сегодня
-        return "08-16", dt.date().strftime("%Y-%m-%d")
-    if t < time(20,0):          # 16:00–19:59 → последняя 16-20 сегодня
-        return "16-20", dt.date().strftime("%Y-%m-%d")
-    # 20:00–23:59 → последняя 20-08 сегодня
-    return "20-08", dt.date().strftime("%Y-%m-%d")
-
-async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != CHAT_ID:
-        return
-    arg = (ctx.args[0].lower() if ctx.args else "").strip()
-    now_dt = now()
-
-    if arg in ("08-16", "16-20", "20-08", "night"):
-        window = "20-08" if arg == "night" else arg
-        # дата ключа: ночь → вчера, остальное → сегодня
-        date_key = (now_dt.date() - timedelta(days=1)).strftime("%Y-%m-%d") if window == "20-08" else now_dt.date().strftime("%Y-%m-%d")
-    else:
-        window, date_key = last_window_and_date(now_dt)
-
-    text = await summary_for(window, date_key)
-    await ctx.bot.send_message(CHAT_ID, text)
-    await send_joke(ctx)
-
-async def main():
-    if not TOKEN or not CHAT_ID:
-        raise RuntimeError("BOT_TOKEN/CHAT_ID/TIMEZONE не заданы в Variables.")
-    await init_db()
-
-    app = (Application.builder()
-           .token(TOKEN)
-           .rate_limiter(AIORateLimiter())
-           .build())
-
-    # Слушаем чат/канал и копим счётчики
-    app.add_handler(MessageHandler(filters.Chat(CHAT_ID) & (filters.TEXT | filters.CAPTION), on_any))
-    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, on_any))
-    # Ручная команда
-    app.add_handler(CommandHandler("summary", cmd_summary))
-
-    # Планировщик: 16:00, 20:00, 08:00
-    app.job_queue.run_daily(send_16, time(16,0), timezone=TZ)
-    app.job_queue.run_daily(send_20, time(20,0), timezone=TZ)
-    app.job_queue.run_daily(send_08, time(8,0),  timezone=TZ)
-
-    await app.initialize(); await app.start()
-    try:
-        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        await asyncio.Event().wait()
-    finally:
-        await app.updater.stop(); await app.stop(); await app.shutdown()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    if t < time(8,0):           # 00:00–07:59 → последняя ночь 20-08 (вчера)
+        return "20-08", (dt.date() - timedelta(days=1)).strftime("%Y
