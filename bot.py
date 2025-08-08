@@ -1,133 +1,81 @@
-# Lead-counter bot: отчёты 08-16, 16-20, 20-08 (ночь) + шутка, + /summary
-import asyncio, re, os, aiosqlite, pytz, random
+import logging
+import asyncio
 from datetime import datetime, time, timedelta
+import pytz
+import random
 from telegram import Update
-from telegram.ext import (
-    Application, MessageHandler, CommandHandler,
-    filters, ContextTypes, AIORateLimiter
-)
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
-# ---- переменные окружения ----
-TOKEN   = os.getenv("BOT_TOKEN")
-CHAT_ID = int(os.getenv("CHAT_ID", "0"))  # например -1002485440713
-TZ      = pytz.timezone(os.getenv("TIMEZONE", "America/Los_Angeles"))
-DB = "counts.sqlite3"
+# === НАСТРОЙКИ ===
+BOT_TOKEN = "ТОКЕН_ОТ_BOTFATHER"  # <-- сюда токен без @
+CHAT_ID = -1002485440713  # id чата
+TZ = pytz.timezone("America/Los_Angeles")
 
-# ---- категории источников ----
-CATS = {
-    "Angi leads": [r"\bangi\b", r"\bangi leads?\b"],
-    "Yelp leads": [r"\byelp\b", r"\byelp leads?\b"],
-    "Website":    [r"\bwebsite\b", r"\b(site|web)\s?form\b"],
-    "Local":      [r"\blocal\b", r"\bgoogle\s?(ads|maps)?\b"],
-}
+# Логирование
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-# ---- шутливые сообщения ----
-JOKES = [
-    "Hey operators! Still breathing out there? Drop Volty’s conversion, please!",
-    "Operators, are you alive or did the leads eat you? Share Volty’s conversion!",
-    "Yo team! Blink twice if you’re alive… and send Volty’s conversion rate!",
-    "Operators, quit hiding! We need Volty’s conversion stats before they fossilize!",
-    "Knock knock… anyone home? Time to spill Volty’s conversion beans!",
-    "Dear Operators, if you read this, send Volty’s conversion… or we’ll assume you’ve joined the witness protection program!",
-    "Still on planet Earth, operators? Beam over Volty’s conversion numbers!",
-    "Ping! Just checking if you exist. Also, where’s Volty’s conversion?",
-    "Operators, is it nap time? Wake up and give us Volty’s conversion, pronto!",
-    "Hello from the outside 🎶… now send Volty’s conversion from the inside!",
-]
-
-def now() -> datetime: return datetime.now(TZ)
-
-def window_name(dt: datetime) -> str:
-    t = dt.time()
-    if time(8,0)  <= t < time(16,0): return "08-16"
-    if time(16,0) <= t < time(20,0): return "16-20"
-    return "20-08"
-
-def window_key_date(dt: datetime) -> str:
-    # дата НАЧАЛА окна; ночь 00:00–07:59 относится к вчера
-    w = window_name(dt)
-    d = dt.date()
-    if w == "20-08" and dt.time() < time(8,0):
-        d = d - timedelta(days=1)
-    return d.strftime("%Y-%m-%d")
-
-async def init_db():
-    async with aiosqlite.connect(DB) as db:
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS counts(
-            chat_id INTEGER,
-            date TEXT,
-            window TEXT,
-            category TEXT,
-            cnt INTEGER,
-            PRIMARY KEY(chat_id, date, window, category)
-        )""")
-        await db.commit()
-
-def classify(text: str) -> str | None:
-    t = (text or "").lower()
-    for name, rules in CATS.items():
-        for r in rules:
-            if re.search(r, t):
-                return name
-    return None
-
-async def bump(cat: str, dt: datetime):
-    d = window_key_date(dt)
-    w = window_name(dt)
-    async with aiosqlite.connect(DB) as db:
-        await db.execute("""
-            INSERT INTO counts(chat_id, date, window, category, cnt)
-            VALUES(?, ?, ?, ?, 1)
-            ON CONFLICT(chat_id, date, window, category)
-            DO UPDATE SET cnt = cnt + 1
-        """, (CHAT_ID, d, w, cat))
-        await db.commit()
-
-async def on_any(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_chat or update.effective_chat.id != CHAT_ID:
-        return
-    text = (update.effective_message and (update.effective_message.text or update.effective_message.caption)) or \
-           (update.channel_post   and (update.channel_post.text   or update.channel_post.caption)) or ""
-    cat = classify(text)
-    if cat:
-        await bump(cat, now())
-
-async def summary_for(window: str, date_key: str) -> str:
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute("""
-            SELECT category, cnt FROM counts
-            WHERE chat_id=? AND date=? AND window=?
-            ORDER BY cnt DESC
-        """, (CHAT_ID, date_key, window))
-        rows = await cur.fetchall()
-    total = sum(c for _, c in rows)
-    lines = [f"📊 Сводка {date_key} {window} (всего: {total})"]
-    lines += [f"• {cat} — {cnt}" for cat, cnt in rows] or ["• Лидов не найдено."]
-    lines.append("Эй операторы, были ли еще лиды — проверяйте!")
-    return "\n".join(lines)
-
-async def send_joke(ctx: ContextTypes.DEFAULT_TYPE):
-    await ctx.bot.send_message(CHAT_ID, random.choice(JOKES))
-
-# --- задачи по расписанию ---
-async def send_16(ctx: ContextTypes.DEFAULT_TYPE):
-    date_key = now().date().strftime("%Y-%m-%d")
-    await ctx.bot.send_message(CHAT_ID, await summary_for("08-16", date_key))
-    await send_joke(ctx)
-
-async def send_20(ctx: ContextTypes.DEFAULT_TYPE):
-    date_key = now().date().strftime("%Y-%m-%d")
-    await ctx.bot.send_message(CHAT_ID, await summary_for("16-20", date_key))
-    await send_joke(ctx)
-
-async def send_08(ctx: ContextTypes.DEFAULT_TYPE):
-    date_key = (now().date() - timedelta(days=1)).strftime("%Y-%m-%d")
-    await ctx.bot.send_message(CHAT_ID, await summary_for("20-08", date_key))
-    await send_joke(ctx)
-
-# --- команда /summary ---
+# === Вспомогательные функции ===
 def last_window_and_date(dt: datetime) -> tuple[str, str]:
     t = dt.time()
-    if t < time(8,0):           # 00:00–07:59 → последняя ночь 20-08 (вчера)
-        return "20-08", (dt.date() - timedelta(days=1)).strftime("%Y
+    if t < time(8,0):           # 00:00–07:59
+        return "20-08", (dt.date() - timedelta(days=1)).strftime("%Y-%m-%d")
+    if t < time(16,0):          # 08:00–15:59
+        return "08-16", dt.date().strftime("%Y-%m-%d")
+    if t < time(20,0):          # 16:00–19:59
+        return "16-20", dt.date().strftime("%Y-%m-%d")
+    return "20-08", dt.date().strftime("%Y-%m-%d")  # 20:00–23:59
+
+# Список шуточных фраз
+jokes = [
+    "Hey team, are you still alive? What's the Volty conversion?",
+    "Knock-knock! Anyone counting the Volty leads today?",
+    "Wake up, operators! We need the conversion stats.",
+    "If this chat was a lead, would you convert it? Give me numbers!",
+    "Psst... conversion report, please? Don't make me send memes.",
+    "Attention crew! Volty conversion check-in time!",
+    "Do we have conversions or are they hiding?",
+    "Yo! Operators! Numbers, please!",
+    "Conversion fairy came? Show me the magic numbers.",
+    "Lead report time! Who’s on duty?"
+]
+
+async def send_joke(app):
+    msg = random.choice(jokes)
+    await app.bot.send_message(chat_id=CHAT_ID, text=msg)
+
+# === Хэндлеры ===
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Bot is running!")
+
+async def handle_leads(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    await context.bot.send_message(chat_id=CHAT_ID, text=f"📢 Lead info received:\n{text}")
+    await send_joke(context.application)
+
+async def send_daily_summary(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(TZ)
+    window, date_str = last_window_and_date(now)
+    await context.bot.send_message(chat_id=CHAT_ID, text=f"📊 Summary for {date_str}, window {window}")
+
+async def manual_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(TZ)
+    window, date_str = last_window_and_date(now)
+    await context.bot.send_message(chat_id=CHAT_ID, text=f"📊 Manual summary for {date_str}, window {window}")
+
+# === Запуск бота ===
+async def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("summary", manual_summary))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_leads))
+
+    # Автосводки в 8:00, 16:00, 20:00
+    app.job_queue.run_daily(send_daily_summary, time(hour=8, minute=0, tzinfo=TZ))
+    app.job_queue.run_daily(send_daily_summary, time(hour=16, minute=0, tzinfo=TZ))
+    app.job_queue.run_daily(send_daily_summary, time(hour=20, minute=0, tzinfo=TZ))
+
+    await app.run_polling()
+
+if __name__ == "__main__":
+    asyncio.run(main())
