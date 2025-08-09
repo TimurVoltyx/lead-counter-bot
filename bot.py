@@ -1,207 +1,125 @@
-# lead-counter-bot (WEBHOOK): окна 08–16 / 16–20 / 20–08, авто-сводки 08/16/20,
-# команда /summary (+фолбэк), подсчёт по категориям, шутка после лидов и сводок.
-import os, re, random, asyncio, aiosqlite, pytz
-from datetime import datetime, time, timedelta
+# bot.py
+# =======
+# Требуются env-переменные: BOT_TOKEN, CHAT_ID, TIMEZONE, WEBHOOK_URL
+# requirements.txt: python-telegram-bot[rate-limiter,job-queue,webhooks]==21.4, aiosqlite, pytz
+
+import os
+import logging
+from urllib.parse import urlparse
+from datetime import datetime, timedelta, timezone
+
 from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    ContextTypes, AIORateLimiter, filters,
+    Application, ApplicationBuilder,
+    CommandHandler, MessageHandler, ContextTypes, filters
 )
 
+# ---------- ЛОГИ ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+log = logging.getLogger("lead-counter-bot")
+
 # ---------- ENV ----------
-TOKEN       = os.getenv("BOT_TOKEN")
-CHAT_ID     = int(os.getenv("CHAT_ID", "0"))
-TZ          = pytz.timezone(os.getenv("TIMEZONE", "America/Los_Angeles"))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")            # https://...railway.app/<secret>
-PORT        = int(os.getenv("PORT", "8080"))
-URL_PATH    = WEBHOOK_URL.rstrip("/").split("/")[-1] if WEBHOOK_URL else ""
-DB          = "counts.sqlite3"
+BOT_TOKEN   = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID_RAW = os.getenv("CHAT_ID", "").strip()
+TIMEZONE    = os.getenv("TIMEZONE", "America/Los_Angeles").strip()
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()  # например: https://lead-counter-bot-production.up.railway.app/hook-1111
 
-# ---------- КАТЕГОРИИ ----------
-CATS = {
-    "Angi leads": [r"\bangi\b", r"\bangi\s+leads?\b"],
-    "Yelp leads": [r"\byelp\b", r"\byelp\s+leads?\b"],
-    "Website":    [r"\bwebsite\b", r"\b(site|web)\s?form\b"],
-    "Local":      [r"\blocal\b", r"\bgoogle\s?(ads|maps)?\b"],
-}
+if not BOT_TOKEN:
+    raise RuntimeError("ENV BOT_TOKEN is empty")
+if not CHAT_ID_RAW:
+    raise RuntimeError("ENV CHAT_ID is empty")
+try:
+    CHAT_ID = int(CHAT_ID_RAW)  # для супергрупп будет отрицательный
+except ValueError:
+    raise RuntimeError("ENV CHAT_ID must be integer (e.g. -1002485440713)")
 
-# ---------- ШУТОЧНЫЕ ПИНКИ ----------
-JOKES = [
-    "Hey operators! Still breathing out there? Drop Volty’s conversion, please!",
-    "Operators, are you alive or did the leads eat you? Share Volty’s conversion!",
-    "Yo team! Blink twice if you’re alive… and send Volty’s conversion rate!",
-    "Operators, quit hiding! We need Volty’s conversion stats before they fossilize!",
-    "Knock knock… anyone home? Time to spill Volty’s conversion beans!",
-    "Dear Operators, if you read this, send Volty’s conversion… or we’ll assume you’ve joined the witness protection program!",
-    "Still on planet Earth, operators? Beam over Volty’s conversion numbers!",
-    "Ping! Just checking if you exist. Also, where’s Volty’s conversion?",
-    "Operators, is it nap time? Wake up and give us Volty’s conversion, pronto!",
-    "Hello from the outside 🎶… now send Volty’s conversion from the inside!",
-]
+if not WEBHOOK_URL:
+    raise RuntimeError("ENV WEBHOOK_URL is empty (like https://.../hook-1111)")
+
+# ---------- ВРЕМЕННАЯ ЗОНА ----------
+try:
+    import zoneinfo
+    TZ = zoneinfo.ZoneInfo(TIMEZONE)
+except Exception:
+    TZ = timezone.utc
+    log.warning("Could not load timezone '%s', fallback to UTC", TIMEZONE)
 
 # ---------- ВСПОМОГАТЕЛЬНОЕ ----------
-def now() -> datetime:
+def now_local():
     return datetime.now(TZ)
 
-def window_name(dt: datetime) -> str:
-    t = dt.time()
-    if time(8,0)  <= t < time(16,0): return "08-16"
-    if time(16,0) <= t < time(20,0): return "16-20"
-    return "20-08"
-
-def window_key_date(dt: datetime) -> str:
-    # дата начала окна; ночь 00:00–07:59 относится к вчерашнему 20:00
-    w = window_name(dt)
-    d = dt.date()
-    if w == "20-08" and dt.time() < time(8,0):
-        d = d - timedelta(days=1)
-    return d.strftime("%Y-%m-%d")
-
-async def init_db():
-    async with aiosqlite.connect(DB) as db:
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS counts(
-            chat_id INTEGER,
-            date TEXT,       -- дата начала окна
-            window TEXT,     -- 08-16 | 16-20 | 20-08
-            category TEXT,
-            cnt INTEGER,
-            PRIMARY KEY(chat_id, date, window, category)
-        )""")
-        await db.commit()
-
-def classify(text: str) -> str | None:
-    t = (text or "").lower()
-    for name, pats in CATS.items():
-        for p in pats:
-            if re.search(p, t):
-                return name
-    return None
-
-async def bump(cat: str, dt: datetime):
-    d = window_key_date(dt); w = window_name(dt)
-    async with aiosqlite.connect(DB) as db:
-        await db.execute("""
-            INSERT INTO counts(chat_id, date, window, category, cnt)
-            VALUES(?, ?, ?, ?, 1)
-            ON CONFLICT(chat_id, date, window, category) DO UPDATE SET cnt = cnt + 1
-        """, (CHAT_ID, d, w, cat))
-        await db.commit()
-
-# ---------- ХЭНДЛЕРЫ ----------
-async def on_any(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # считаем только в целевом чате/канале
-    if not update.effective_chat or int(update.effective_chat.id) != CHAT_ID:
-        return
-    msg = update.effective_message or update.channel_post
-    text = (msg and (msg.text or msg.caption)) or ""
-    cat = classify(text)
-    if cat:
-        await bump(cat, now())
-        # пинок сразу после зафиксированного лида
-        await ctx.bot.send_message(CHAT_ID, random.choice(JOKES))
-
-async def summary_for(window: str, date_key: str) -> str:
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute("""
-            SELECT category, cnt FROM counts
-            WHERE chat_id=? AND date=? AND window=?
-            ORDER BY cnt DESC
-        """, (CHAT_ID, date_key, window))
-        rows = await cur.fetchall()
-    total = sum(c for _, c in rows)
-    lines = [f"📊 Summary {date_key} {window} — total: {total}"]
-    lines += [f"• {cat}: {cnt}" for cat, cnt in rows] or ["• No matches."]
-    lines.append("Hey operators, any more leads? Please double-check!")
-    return "\n".join(lines)
-
-async def send_joke(ctx: ContextTypes.DEFAULT_TYPE):
-    await ctx.bot.send_message(CHAT_ID, random.choice(JOKES))
-
-async def send_16(ctx: ContextTypes.DEFAULT_TYPE):
-    await ctx.bot.send_message(CHAT_ID, await summary_for("08-16", now().date().strftime("%Y-%m-%d"))); await send_joke(ctx)
-
-async def send_20(ctx: ContextTypes.DEFAULT_TYPE):
-    await ctx.bot.send_message(CHAT_ID, await summary_for("16-20", now().date().strftime("%Y-%m-%d"))); await send_joke(ctx)
-
-async def send_08(ctx: ContextTypes.DEFAULT_TYPE):
-    await ctx.bot.send_message(CHAT_ID, await summary_for("20-08", (now().date()-timedelta(days=1)).strftime("%Y-%m-%d"))); await send_joke(ctx)
-
-def last_window_and_date(dt: datetime):
-    t = dt.time()
-    if t < time(8,0):  return "20-08", (dt.date()-timedelta(days=1)).strftime("%Y-%m-%d")
-    if t < time(16,0): return "08-16", dt.date().strftime("%Y-%m-%d")
-    if t < time(20,0): return "16-20", dt.date().strftime("%Y-%m-%d")
-    return "20-08", dt.date().strftime("%Y-%m-%d")
-
-async def _do_summary(arg, ctx: ContextTypes.DEFAULT_TYPE):
-    now_dt = now()
-    if arg in ("08-16", "16-20", "20-08", "night"):
-        window = "20-08" if arg == "night" else arg
-        date_key = (now_dt.date() - timedelta(days=1)).strftime("%Y-%m-%d") if window == "20-08" else now_dt.date().strftime("%Y-%m-%d")
-    else:
-        window, date_key = last_window_and_date(now_dt)
-    await ctx.bot.send_message(CHAT_ID, await summary_for(window, date_key))
-    await send_joke(ctx)
-
+# Простая заглушка для /summary — вернёт 0 и пинганёт операторов
 async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if int(update.effective_chat.id) != CHAT_ID: return
-    arg = (ctx.args[0].lower() if ctx.args else None)
-    await _do_summary(arg, ctx)
+    # фильтруем по нашему чату
+    if update.effective_chat and update.effective_chat.id != CHAT_ID:
+        return
 
-async def fallback_summary_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # на случай "текст ... /summary 16-20"
-    if int(update.effective_chat.id) != CHAT_ID: return
-    text = (update.effective_message and update.effective_message.text) or ""
-    if not text: return
-    low = text.lower()
-    if "/summary" in low:
-        arg = None
-        parts = low.split()
-        for i, p in enumerate(parts):
-            if p.startswith("/summary") and i+1 < len(parts):
-                cand = parts[i+1].strip()
-                if cand in ("08-16","16-20","20-08","night"): arg = cand
-                break
-        await _do_summary(arg, ctx)
+    ts = now_local().strftime("%Y-%m-%d %H:%M")
+    text = (
+        f"📊 Summary {ts} — total: 0\n"
+        f"• No matches.\n"
+        f"Hey operators, any more leads? Please double-check!"
+    )
+    await ctx.bot.send_message(chat_id=CHAT_ID, text=text)
 
-# ---------- APP ----------
-def build_app() -> Application:
-    app = (Application.builder()
-           .token(TOKEN)
-           .rate_limiter(AIORateLimiter())
-           .build())
+# Простой ping
+async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat and update.effective_chat.id != CHAT_ID:
+        return
+    await ctx.bot.send_message(chat_id=CHAT_ID, text="pong")
 
-    # handlers
+# ---------- ГЛАВНЫЙ ОТЛАДОЧНЫЙ ОБРАБОТЧИК ----------
+# Ловит ВСЕ апдейты из нашего чата. Если бот ничего не отвечает — апдейты не доходят.
+async def debug_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # ограничиваем только нашим чатом, чтобы не шуметь
+    if update.effective_chat and update.effective_chat.id != CHAT_ID:
+        return
+
+    try:
+        payload = update.to_dict()
+        log.info("RAW UPDATE: %s", payload)
+    except Exception as e:
+        log.exception("Failed to dump update: %s", e)
+
+    # Покажем, что бот реально видит сообщение
+    try:
+        if update.effective_message:
+            await update.effective_message.reply_text("Лщвите его!")
+        else:
+            # если нет message (например callback_query и т.п.), шлем отдельным send_message
+            await ctx.bot.send_message(chat_id=CHAT_ID, text="Я вижу апдейт (не message)!")
+    except Exception as e:
+        log.exception("Failed to reply in debug_all: %s", e)
+
+# ---------- MAIN ----------
+def main():
+    log.info("Starting bot, CHAT_ID=%s, TZ=%s", CHAT_ID, TIMEZONE)
+
+    app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Команды
     app.add_handler(CommandHandler("summary", cmd_summary))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_summary_text))
-    app.add_handler(MessageHandler(filters.Chat(CHAT_ID) & (filters.TEXT | filters.CAPTION), on_any))
-    app.add_handler(MessageHandler(filters.ChatType.CHANNEL & (filters.TEXT | filters.CAPTION), on_any))
+    app.add_handler(CommandHandler("ping", cmd_ping))
 
-    # расписание
-    app.job_queue.run_daily(send_16, time(16, 0, tzinfo=TZ))
-    app.job_queue.run_daily(send_20, time(20, 0, tzinfo=TZ))
-    app.job_queue.run_daily(send_08, time(8,  0, tzinfo=TZ))
-    return app
+    # ОТЛАДОЧНЫЙ ХЕНДЛЕР — ВСЁ, ЧТО ПРИХОДИТ
+    app.add_handler(MessageHandler(filters.ALL, debug_all))
 
-# ---------- ENTRY ----------
-if __name__ == "__main__":
-    if not TOKEN or CHAT_ID == 0 or not WEBHOOK_URL:
-        raise RuntimeError("Set BOT_TOKEN, CHAT_ID, TIMEZONE, WEBHOOK_URL in Railway Variables.")
+    # ---- WEBHOOK ----
+    # Railway слушает порт 8080. path берём из WEBHOOK_URL (/hook-xxxx)
+    parsed = urlparse(WEBHOOK_URL)
+    hook_path = parsed.path if parsed.path else "/hook"
+    # Важное: set_webhook делает сама PTB внутри run_webhook
+    log.info("Running webhook at 0.0.0.0:8080 path=%s, public_url=%s", hook_path, WEBHOOK_URL)
 
-    # init DB (async) перед запуском
-    asyncio.run(init_db())
-
-    app = build_app()
-
-    # FIX для Py3.12 / PTB run_webhook: задаём event loop вручную
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    # Стартуем webhook (PTB сам поставит setWebhook)
     app.run_webhook(
         listen="0.0.0.0",
-        port=PORT,
-        url_path=URL_PATH,        # секретный хвост
-        webhook_url=WEBHOOK_URL,  # полный URL
+        port=8080,
+        url_path=hook_path.lstrip("/"),
+        webhook_url=WEBHOOK_URL
     )
+
+if __name__ == "__main__":
+    main()
