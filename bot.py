@@ -1,5 +1,5 @@
 # lead-counter-bot (WEBHOOK): 08–16, 16–20, 20–08 + /summary + jokes (PTB 21.x)
-import asyncio, os, re, random, aiosqlite, pytz
+import os, re, random, aiosqlite, pytz, asyncio
 from datetime import datetime, time, timedelta
 from telegram import Update
 from telegram.ext import (
@@ -141,39 +141,37 @@ async def fallback_summary_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 break
         await _do_summary(arg, ctx)
 
-# ---------- MAIN ----------
-async def main():
-    if not TOKEN or CHAT_ID == 0 or not WEBHOOK_URL:
-        raise RuntimeError("Set BOT_TOKEN, CHAT_ID, TIMEZONE, WEBHOOK_URL in Railway Variables.")
-
-    await init_db()
-
+# ---------- APP BUILD ----------
+def build_app() -> Application:
     app = (Application.builder()
            .token(TOKEN)
            .rate_limiter(AIORateLimiter())
            .build())
 
-    # lead messages & commands
+    # handlers
     app.add_handler(CommandHandler("summary", cmd_summary))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_summary_text))
     app.add_handler(MessageHandler(filters.Chat(CHAT_ID) & (filters.TEXT | filters.CAPTION), on_any))
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL & (filters.TEXT | filters.CAPTION), on_any))
 
-    # schedules
+    # jobs
     app.job_queue.run_daily(send_16, time(16,0, tzinfo=TZ))
     app.job_queue.run_daily(send_20, time(20,0, tzinfo=TZ))
     app.job_queue.run_daily(send_08, time(8, 0, tzinfo=TZ))
+    return app
 
-    # webhook only (никакого polling)
-    await app.initialize()
-    await app.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
-    await app.start()
-    await app.run_webhook(
+# ---------- ENTRY ----------
+if __name__ == "__main__":
+    if not TOKEN or CHAT_ID == 0 or not WEBHOOK_URL:
+        raise RuntimeError("Set BOT_TOKEN, CHAT_ID, TIMEZONE, WEBHOOK_URL in Railway Variables.")
+    # инициализируем БД до старта приложения
+    asyncio.run(init_db())
+
+    app = build_app()
+    # Важно: run_webhook СИНХРОННЫЙ — НЕ оборачивать в asyncio.run и НЕ await!
+    app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path=URL_PATH,
-        webhook_url=WEBHOOK_URL,
+        webhook_url=WEBHOOK_URL,  # PTB сам вызовет setWebhook
     )
-
-if __name__ == "__main__":
-    asyncio.run(main())
