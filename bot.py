@@ -87,7 +87,7 @@ async def debug_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Покажем, что бот реально видит сообщение
     try:
         if update.effective_message:
-            await update.effective_message.reply_text("Я вижу это сообщение!")
+            await update.effective_message.reply_text("Не расслобляем булки! ЛИД")
         else:
             # если нет message (например callback_query и т.п.), шлем отдельным send_message
             await ctx.bot.send_message(chat_id=CHAT_ID, text="Я вижу апдейт (не message)!")
