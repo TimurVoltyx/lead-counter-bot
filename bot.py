@@ -1,6 +1,7 @@
-import logging
 import os
+import logging
 import random
+import asyncio
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
@@ -31,18 +32,18 @@ CLEAN_WINDOW_HOURS = 3
 # Файл БД
 DB_PATH = os.getenv("DB_PATH", "leads.db")
 
-# Полные подталкивающие фразы (10 шт.) — каждая пойдёт и после /summary, и после каждого лида
-NUDGE_LINES = [
-    "Dear Operators, if you read this, send Volty’s conversion… or we’ll assume you’ve joined the witness protection program!",
-    "Hey operators! Are you alive? Please share Volty’s conversion numbers.",
-    "Operators, don’t be shy—drop Volty’s conversion in the chat!",
-    "Ping! If you can see this, send Volty’s conversion. Pretty please.",
-    "Still breathing, team? Post Volty’s conversion before the coffee gets cold.",
-    "Friendly poke: conversion, please. Volty is watching. 👀",
-    "Quick check-in: any updates on conversion? Don’t ghost us!",
-    "Hello, humans! Kindly provide Volty’s conversion before we send a search party.",
-    "Conversion status, anyone? We promise not to judge… much.",
-    "If you can read this, it’s a sign to send the conversion. Now. Thank you!",
+# 10 позитивных вариантов напоминания (высылаются ЧЕРЕЗ 5 минут после лида)
+REMINDERS = [
+    "Хей, уважаемые операторы! Лид не пропустили? Всё ок? 😺",
+    "Команда, just checking — всё ли в порядке с последним лидом? 😺",
+    "Операторы, быстрый пинг: лид в работе, всё норм? 😺",
+    "Эй, команда! Подтвердите, что лид под контролем, плиз. 😺",
+    "Напоминалка: последний лид в порядке? Если что — маякните. 😺",
+    "Привет! Уточняю: лид на месте, ничего не потерялось? 😺",
+    "Friendly check: лид обработан? Дайте знать, если что-то нужно. 😺",
+    "Йо-хо! Всё ли хорошо с лидом? Не пропустили? 😺",
+    "Мини-пинг: лид виден/в работе? Спасибо! 😺",
+    "Команда, всё ли гладко с новым лидом? Если что — мы рядом. 😺",
 ]
 
 # Логирование
@@ -65,11 +66,9 @@ DISPLAY = {
     "yelp": "Yelp leads",
     "local": "Local",
     "website": "Website",
-    "thumbtack": "Thumbtack leads",   # НОВОЕ
+    "thumbtack": "Thumbtack leads",
 }
-
 ORDER = ["angi", "yelp", "local", "website", "thumbtack"]
-
 
 def classify_source(text: str) -> str | None:
     if not text:
@@ -98,7 +97,6 @@ def classify_source(text: str) -> str | None:
 
     return None
 
-
 # ----------------------- БД -----------------------
 
 INIT_SQL = """
@@ -114,7 +112,6 @@ CREATE INDEX IF NOT EXISTS idx_ts ON leads(ts_utc);
 CREATE INDEX IF NOT EXISTS idx_source ON leads(source);
 """
 
-
 async def db_init():
     async with aiosqlite.connect(DB_PATH) as db:
         for stmt in INIT_SQL.strip().split(";"):
@@ -122,7 +119,6 @@ async def db_init():
             if s:
                 await db.execute(s)
         await db.commit()
-
 
 async def db_add_lead(chat_id: int, message_id: int, ts_utc: int, source: str) -> bool:
     try:
@@ -135,7 +131,6 @@ async def db_add_lead(chat_id: int, message_id: int, ts_utc: int, source: str) -
         return True
     except aiosqlite.IntegrityError:
         return False
-
 
 async def db_counts_for_today(tz) -> dict:
     now_local = datetime.now(tz)
@@ -156,7 +151,6 @@ async def db_counts_for_today(tz) -> dict:
                 out[row[0]] = row[1]
     return out
 
-
 async def db_clean_last_hours(hours: int) -> int:
     now_utc = int(datetime.now(timezone.utc).timestamp())
     threshold = now_utc - hours * 3600
@@ -165,13 +159,21 @@ async def db_clean_last_hours(hours: int) -> int:
         await db.commit()
         return cur.rowcount
 
+# ----------------------- Напоминание через 5 минут -----------------------
+
+async def delayed_reminder(ctx: ContextTypes.DEFAULT_TYPE):
+    # ждём 5 минут
+    await asyncio.sleep(300)
+    try:
+        await ctx.bot.send_message(chat_id=CHAT_ID, text=random.choice(REMINDERS))
+    except Exception:
+        pass
 
 # ----------------------- Хэндлеры -----------------------
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat and update.effective_chat.id == CHAT_ID:
         await update.effective_message.reply_text("pong")
-
 
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat or update.effective_chat.id != CHAT_ID:
@@ -188,11 +190,8 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     now_local = datetime.now(TZ)
     title = f"📊 Summary {now_local.strftime('%Y-%m-%d %H:%M')} — total: {total}"
-
-    tail = random.choice(NUDGE_LINES)
-    txt = title + "\n" + "\n".join(lines) + "\n\n" + tail
+    txt = title + "\n" + "\n".join(lines)
     await update.effective_message.reply_text(txt)
-
 
 async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat or update.effective_chat.id != CHAT_ID:
@@ -201,7 +200,6 @@ async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"🧹 Cleared {deleted} rows from the last {CLEAN_WINDOW_HOURS} hours."
     )
-
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -221,12 +219,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("✅ Lead counted")
         except Exception:
             pass
-        # 2) следом — одна из 10 английских подсказок операторам
+        # 2) одно напоминание через 5 минут (случайная фраза)
         try:
-            await context.bot.send_message(chat_id=CHAT_ID, text=random.choice(NUDGE_LINES))
+            context.application.create_task(delayed_reminder(context))
         except Exception:
             pass
-
 
 # ----------------------- Webhook / приложение -----------------------
 
@@ -239,10 +236,8 @@ def parse_webhook_path(public_url: str) -> str:
     except Exception:
         return "/hook-1111"
 
-
 async def on_startup(app: Application):
     await db_init()
-
 
 def build_application() -> Application:
     if not BOT_TOKEN:
@@ -256,14 +251,12 @@ def build_application() -> Application:
         .build()
     )
 
-    application.add_handler(CommandHandler("ping", cmd_ping, filters=filters.Chat(CHAT_ID)))
-    application.add_handler(CommandHandler("summary", cmd_summary, filters=filters.Chat(CHAT_ID)))
-    application.add_handler(CommandHandler("clean", cmd_clean, filters=filters.Chat(CHAT_ID)))
-
+    application.add_handler(CommandHandler("ping",   cmd_ping,   filters=filters.Chat(CHAT_ID)))
+    application.add_handler(CommandHandler("summary",cmd_summary,filters=filters.Chat(CHAT_ID)))
+    application.add_handler(CommandHandler("clean",  cmd_clean,  filters=filters.Chat(CHAT_ID)))
     application.add_handler(MessageHandler(filters.Chat(CHAT_ID) & filters.TEXT, handle_message))
 
     return application
-
 
 def main():
     app = build_application()
@@ -281,7 +274,6 @@ def main():
         allowed_updates=["message", "edited_message"],
         url_path=path,
     )
-
 
 if __name__ == "__main__":
     main()
