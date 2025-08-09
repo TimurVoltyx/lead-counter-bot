@@ -1,5 +1,6 @@
-# lead-counter-bot (WEBHOOK): 08–16, 16–20, 20–08 + /summary + jokes (PTB 21.x)
-import os, re, random, aiosqlite, pytz, asyncio
+# lead-counter-bot (WEBHOOK): окна 08–16 / 16–20 / 20–08, авто-сводки 08/16/20,
+# команда /summary (+фолбэк), подсчёт по категориям, шутка после лидов и сводок.
+import os, re, random, asyncio, aiosqlite, pytz
 from datetime import datetime, time, timedelta
 from telegram import Update
 from telegram.ext import (
@@ -8,12 +9,12 @@ from telegram.ext import (
 )
 
 # ---------- ENV ----------
-TOKEN       = os.getenv("BOT_TOKEN")                        # токен бота (без @)
-CHAT_ID     = int(os.getenv("CHAT_ID", "0"))                # целевой чат, например -1002485440713
+TOKEN       = os.getenv("BOT_TOKEN")
+CHAT_ID     = int(os.getenv("CHAT_ID", "0"))
 TZ          = pytz.timezone(os.getenv("TIMEZONE", "America/Los_Angeles"))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")                  # https://...railway.app/<secret>
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")            # https://...railway.app/<secret>
 PORT        = int(os.getenv("PORT", "8080"))
-URL_PATH    = WEBHOOK_URL.rstrip("/").split("/")[-1] if WEBHOOK_URL else ""  # secret path
+URL_PATH    = WEBHOOK_URL.rstrip("/").split("/")[-1] if WEBHOOK_URL else ""
 DB          = "counts.sqlite3"
 
 # ---------- КАТЕГОРИИ ----------
@@ -38,7 +39,7 @@ JOKES = [
     "Hello from the outside 🎶… now send Volty’s conversion from the inside!",
 ]
 
-# ---------- HELPERS ----------
+# ---------- ВСПОМОГАТЕЛЬНОЕ ----------
 def now() -> datetime:
     return datetime.now(TZ)
 
@@ -49,7 +50,7 @@ def window_name(dt: datetime) -> str:
     return "20-08"
 
 def window_key_date(dt: datetime) -> str:
-    """Дата начала окна (ночь 00:00–07:59 относится к вчерашнему 20:00)."""
+    # дата начала окна; ночь 00:00–07:59 относится к вчерашнему 20:00
     w = window_name(dt)
     d = dt.date()
     if w == "20-08" and dt.time() < time(8,0):
@@ -78,8 +79,7 @@ def classify(text: str) -> str | None:
     return None
 
 async def bump(cat: str, dt: datetime):
-    d = window_key_date(dt)
-    w = window_name(dt)
+    d = window_key_date(dt); w = window_name(dt)
     async with aiosqlite.connect(DB) as db:
         await db.execute("""
             INSERT INTO counts(chat_id, date, window, category, cnt)
@@ -90,7 +90,7 @@ async def bump(cat: str, dt: datetime):
 
 # ---------- ХЭНДЛЕРЫ ----------
 async def on_any(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Ловим входящие в наш чат/канал. Если совпало по правилам — считаем и кидаем шуточный пинок."""
+    # считаем только в целевом чате/канале
     if not update.effective_chat or int(update.effective_chat.id) != CHAT_ID:
         return
     msg = update.effective_message or update.channel_post
@@ -98,7 +98,7 @@ async def on_any(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cat = classify(text)
     if cat:
         await bump(cat, now())
-        # сразу после зафиксированного лида — пинок операторам
+        # пинок сразу после зафиксированного лида
         await ctx.bot.send_message(CHAT_ID, random.choice(JOKES))
 
 async def summary_for(window: str, date_key: str) -> str:
@@ -118,32 +118,21 @@ async def summary_for(window: str, date_key: str) -> str:
 async def send_joke(ctx: ContextTypes.DEFAULT_TYPE):
     await ctx.bot.send_message(CHAT_ID, random.choice(JOKES))
 
-# расписание
 async def send_16(ctx: ContextTypes.DEFAULT_TYPE):
-    date_key = now().date().strftime("%Y-%m-%d")
-    await ctx.bot.send_message(CHAT_ID, await summary_for("08-16", date_key))
-    await send_joke(ctx)
+    await ctx.bot.send_message(CHAT_ID, await summary_for("08-16", now().date().strftime("%Y-%m-%d"))); await send_joke(ctx)
 
 async def send_20(ctx: ContextTypes.DEFAULT_TYPE):
-    date_key = now().date().strftime("%Y-%m-%d")
-    await ctx.bot.send_message(CHAT_ID, await summary_for("16-20", date_key))
-    await send_joke(ctx)
+    await ctx.bot.send_message(CHAT_ID, await summary_for("16-20", now().date().strftime("%Y-%m-%d"))); await send_joke(ctx)
 
 async def send_08(ctx: ContextTypes.DEFAULT_TYPE):
-    date_key = (now().date() - timedelta(days=1)).strftime("%Y-%m-%d")
-    await ctx.bot.send_message(CHAT_ID, await summary_for("20-08", date_key))
-    await send_joke(ctx)
+    await ctx.bot.send_message(CHAT_ID, await summary_for("20-08", (now().date()-timedelta(days=1)).strftime("%Y-%m-%d"))); await send_joke(ctx)
 
-# ручная команда /summary (и варианты)
 def last_window_and_date(dt: datetime):
     t = dt.time()
-    if t < time(8,0):           # 00:00–07:59 → последняя ночь (вчера)
-        return "20-08", (dt.date() - timedelta(days=1)).strftime("%Y-%m-%d")
-    if t < time(16,0):          # 08:00–15:59
-        return "08-16", dt.date().strftime("%Y-%m-%d")
-    if t < time(20,0):          # 16:00–19:59
-        return "16-20", dt.date().strftime("%Y-%m-%d")
-    return "20-08", dt.date().strftime("%Y-%m-%d")  # 20:00–23:59
+    if t < time(8,0):  return "20-08", (dt.date()-timedelta(days=1)).strftime("%Y-%m-%d")
+    if t < time(16,0): return "08-16", dt.date().strftime("%Y-%m-%d")
+    if t < time(20,0): return "16-20", dt.date().strftime("%Y-%m-%d")
+    return "20-08", dt.date().strftime("%Y-%m-%d")
 
 async def _do_summary(arg, ctx: ContextTypes.DEFAULT_TYPE):
     now_dt = now()
@@ -156,32 +145,27 @@ async def _do_summary(arg, ctx: ContextTypes.DEFAULT_TYPE):
     await send_joke(ctx)
 
 async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if int(update.effective_chat.id) != CHAT_ID:
-        return
+    if int(update.effective_chat.id) != CHAT_ID: return
     arg = (ctx.args[0].lower() if ctx.args else None)
     await _do_summary(arg, ctx)
 
 async def fallback_summary_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """На случай если в группе команда пришла как текст: '... /summary 16-20'."""
-    if int(update.effective_chat.id) != CHAT_ID:
-        return
+    # на случай "текст ... /summary 16-20"
+    if int(update.effective_chat.id) != CHAT_ID: return
     text = (update.effective_message and update.effective_message.text) or ""
-    if not text:
-        return
+    if not text: return
     low = text.lower()
     if "/summary" in low:
         arg = None
         parts = low.split()
         for i, p in enumerate(parts):
-            if p.startswith("/summary"):
-                if i + 1 < len(parts):
-                    cand = parts[i + 1].strip()
-                    if cand in ("08-16", "16-20", "20-08", "night"):
-                        arg = cand
+            if p.startswith("/summary") and i+1 < len(parts):
+                cand = parts[i+1].strip()
+                if cand in ("08-16","16-20","20-08","night"): arg = cand
                 break
         await _do_summary(arg, ctx)
 
-# ---------- APP BUILD ----------
+# ---------- APP ----------
 def build_app() -> Application:
     app = (Application.builder()
            .token(TOKEN)
@@ -194,7 +178,7 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Chat(CHAT_ID) & (filters.TEXT | filters.CAPTION), on_any))
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL & (filters.TEXT | filters.CAPTION), on_any))
 
-    # jobs (через tzinfo, без timezone=)
+    # расписание
     app.job_queue.run_daily(send_16, time(16, 0, tzinfo=TZ))
     app.job_queue.run_daily(send_20, time(20, 0, tzinfo=TZ))
     app.job_queue.run_daily(send_08, time(8,  0, tzinfo=TZ))
@@ -210,14 +194,14 @@ if __name__ == "__main__":
 
     app = build_app()
 
-    # PTB run_webhook внутри сам юзает loop — создаём его заранее (фикс для Py3.12)
+    # FIX для Py3.12 / PTB run_webhook: задаём event loop вручную
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # Стартуем вебхук (никакого polling)
+    # Стартуем webhook (PTB сам поставит setWebhook)
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        url_path=URL_PATH,         # секретный хвост
-        webhook_url=WEBHOOK_URL,   # полный URL (https://.../<secret>)
+        url_path=URL_PATH,        # секретный хвост
+        webhook_url=WEBHOOK_URL,  # полный URL
     )
