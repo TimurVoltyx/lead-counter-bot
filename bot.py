@@ -1,13 +1,12 @@
-import asyncio
 import logging
 import os
+import random
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 import aiosqlite
 import pytz
 from telegram import Update
-from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     AIORateLimiter,
@@ -17,44 +16,50 @@ from telegram.ext import (
     filters,
 )
 
-# ----------------------- Конфиг/переменные окружения -----------------------
+# ----------------------- Конфиг / env -----------------------
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = int(os.getenv("CHAT_ID", "0"))
 TZ_NAME = os.getenv("TIMEZONE", "America/Los_Angeles")
-WEBHOOK_PUBLIC_URL = os.getenv("WEBHOOK_URL", "").strip()  # например https://.../hook-1111
+WEBHOOK_PUBLIC_URL = os.getenv("WEBHOOK_URL", "").strip()  # https://.../hook-1111
 PORT = int(os.getenv("PORT", "8080"))
 LISTEN_ADDR = "0.0.0.0"
 
-# окно отчёта (сегодня) и окно очистки (последние 3 часа)
+# Сколько часов чистим по /clean
 CLEAN_WINDOW_HOURS = 3
 
-# База
+# Файл БД
 DB_PATH = os.getenv("DB_PATH", "leads.db")
 
-# Пинги-шуточки для операторов (оставляю как у тебя было — несколько вариантов)
+# Полные подталкивающие фразы (10 шт.) — каждая пойдёт и после /summary, и после каждого лида
 NUDGE_LINES = [
-    "Hey operators, any more leads? Please double-check!",
-    "Operators, are you alive or did the leads eat you? Share Volty’s conversion!",
-    "Still on planet Earth, operators? Beam over Volty’s conversion numbers!",
-    "Ping! Just checking if you exist. Also, where’s Volty’s conversion?",
+    "Dear Operators, if you read this, send Volty’s conversion… or we’ll assume you’ve joined the witness protection program!",
+    "Hey operators! Are you alive? Please share Volty’s conversion numbers.",
+    "Operators, don’t be shy—drop Volty’s conversion in the chat!",
+    "Ping! If you can see this, send Volty’s conversion. Pretty please.",
+    "Still breathing, team? Post Volty’s conversion before the coffee gets cold.",
+    "Friendly poke: conversion, please. Volty is watching. 👀",
+    "Quick check-in: any updates on conversion? Don’t ghost us!",
+    "Hello, humans! Kindly provide Volty’s conversion before we send a search party.",
+    "Conversion status, anyone? We promise not to judge… much.",
+    "If you can read this, it’s a sign to send the conversion. Now. Thank you!",
 ]
 
-# Включаем логирование покомфортнее
+# Логирование
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("lead-counter-bot")
 
-# Часовой пояс
+# TZ
 try:
     TZ = pytz.timezone(TZ_NAME)
 except Exception:
     TZ = pytz.utc
 
-# ----------------------- Категории/распознавание -----------------------
-# Имена в отчёте
+# ----------------------- Категории / распознавание -----------------------
+
 DISPLAY = {
     "angi": "Angi leads",
     "yelp": "Yelp leads",
@@ -63,37 +68,31 @@ DISPLAY = {
     "thumbtack": "Thumbtack leads",   # НОВОЕ
 }
 
-# Фиксированный порядок отображения
 ORDER = ["angi", "yelp", "local", "website", "thumbtack"]
 
 
 def classify_source(text: str) -> str | None:
-    """
-    Возвращает ключ категории (angi/yelp/local/website/thumbtack) или None.
-    Распознавание максимально простое и устойчивое к регистру.
-    """
     if not text:
         return None
-
     t = text.lower()
 
-    # thumbtack (НОВОЕ)
+    # Thumbtack
     if "thumbtack" in t or "thumbtack.com" in t or "lead from thumbtack" in t:
         return "thumbtack"
 
-    # angi
+    # Angi
     if "angi" in t or "voltyx lead" in t or "angi.com" in t:
         return "angi"
 
-    # yelp
+    # Yelp
     if "lead from yelp" in t or "yelp" in t:
         return "yelp"
 
-    # local
+    # Local
     if "lead from local" in t:
         return "local"
 
-    # website
+    # Website
     if "website" in t or "check website" in t:
         return "website"
 
@@ -126,10 +125,6 @@ async def db_init():
 
 
 async def db_add_lead(chat_id: int, message_id: int, ts_utc: int, source: str) -> bool:
-    """
-    Сохраняет лид. Возвращает True, если вставилось (новая запись),
-    False — если уже есть такая связка chat_id+message_id.
-    """
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
@@ -142,10 +137,7 @@ async def db_add_lead(chat_id: int, message_id: int, ts_utc: int, source: str) -
         return False
 
 
-async def db_counts_for_today(tz: timezone) -> dict:
-    """
-    Считает количество лидов по категориям за сегодняшние сутки локального TZ.
-    """
+async def db_counts_for_today(tz) -> dict:
     now_local = datetime.now(tz)
     start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
     start_utc = int(start_local.astimezone(timezone.utc).timestamp())
@@ -166,9 +158,6 @@ async def db_counts_for_today(tz: timezone) -> dict:
 
 
 async def db_clean_last_hours(hours: int) -> int:
-    """
-    Удаляет записи за последние N часов. Возвращает число удалённых строк.
-    """
     now_utc = int(datetime.now(timezone.utc).timestamp())
     threshold = now_utc - hours * 3600
     async with aiosqlite.connect(DB_PATH) as db:
@@ -190,9 +179,8 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     counts = await db_counts_for_today(TZ)
 
-    # формируем полный список категорий (даже если 0)
-    lines = []
     total = 0
+    lines = []
     for key in ORDER:
         c = counts.get(key, 0)
         total += c
@@ -201,17 +189,14 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now_local = datetime.now(TZ)
     title = f"📊 Summary {now_local.strftime('%Y-%m-%d %H:%M')} — total: {total}"
 
-    txt = title + "\n" + "\n".join(lines) + "\n" + f"\n{NUDGE_LINES[now_local.minute % len(NUDGE_LINES)]}"
+    tail = random.choice(NUDGE_LINES)
+    txt = title + "\n" + "\n".join(lines) + "\n\n" + tail
     await update.effective_message.reply_text(txt)
 
 
 async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Очищает лиды за последние 3 часа (CLEAN_WINDOW_HOURS).
-    """
     if not update.effective_chat or update.effective_chat.id != CHAT_ID:
         return
-
     deleted = await db_clean_last_hours(CLEAN_WINDOW_HOURS)
     await update.effective_message.reply_text(
         f"🧹 Cleared {deleted} rows from the last {CLEAN_WINDOW_HOURS} hours."
@@ -219,38 +204,33 @@ async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Отрабатывает любые новые сообщения в группе: пытаемся распознать лид, сохранить,
-    и ответить ‘✅ Lead counted’.
-    """
     msg = update.effective_message
     chat = update.effective_chat
-
-    # только указанный чат
     if not chat or chat.id != CHAT_ID or not msg or not msg.text:
         return
 
-    text = msg.text
-    source = classify_source(text)
+    source = classify_source(msg.text)
     if not source:
-        # не похоже на лид — просто выходим
         return
 
     ts_utc = int(datetime.now(timezone.utc).timestamp())
-    ok = await db_add_lead(chat.id, msg.message_id, ts_utc, source)
-    if ok:
+    inserted = await db_add_lead(chat.id, msg.message_id, ts_utc, source)
+    if inserted:
+        # 1) подтверждение
         try:
             await msg.reply_text("✅ Lead counted")
         except Exception:
             pass
+        # 2) следом — одна из 10 английских подсказок операторам
+        try:
+            await context.bot.send_message(chat_id=CHAT_ID, text=random.choice(NUDGE_LINES))
+        except Exception:
+            pass
 
 
-# ----------------------- Webhook/приложение -----------------------
+# ----------------------- Webhook / приложение -----------------------
 
 def parse_webhook_path(public_url: str) -> str:
-    """
-    Извлекаем path из PUBLIC_URL. Если пусто — дефолт /hook-1111.
-    """
     if not public_url:
         return "/hook-1111"
     try:
@@ -276,12 +256,10 @@ def build_application() -> Application:
         .build()
     )
 
-    # Команды
     application.add_handler(CommandHandler("ping", cmd_ping, filters=filters.Chat(CHAT_ID)))
     application.add_handler(CommandHandler("summary", cmd_summary, filters=filters.Chat(CHAT_ID)))
-    application.add_handler(CommandHandler("clean", cmd_clean, filters=filters.Chat(CHAT_ID)))  # НОВОЕ
+    application.add_handler(CommandHandler("clean", cmd_clean, filters=filters.Chat(CHAT_ID)))
 
-    # Сообщения в группе
     application.add_handler(MessageHandler(filters.Chat(CHAT_ID) & filters.TEXT, handle_message))
 
     return application
@@ -289,25 +267,19 @@ def build_application() -> Application:
 
 def main():
     app = build_application()
-
-    # webhook
     path = parse_webhook_path(WEBHOOK_PUBLIC_URL)
-    log.info(
+
+    logging.getLogger().info(
         "Running webhook at %s:%s path=%s, public_url=%s",
-        LISTEN_ADDR,
-        PORT,
-        path,
-        WEBHOOK_PUBLIC_URL or "(NOT SET!)",
+        LISTEN_ADDR, PORT, path, WEBHOOK_PUBLIC_URL or "(NOT SET!)"
     )
 
-    # run_webhook сам выставит setWebhook
     app.run_webhook(
         listen=LISTEN_ADDR,
         port=PORT,
         webhook_url=WEBHOOK_PUBLIC_URL if WEBHOOK_PUBLIC_URL else None,
-        secret_token=None,
         allowed_updates=["message", "edited_message"],
-        url_path=path,  # safe: PTB21 игнорит, когда указан webhook_url
+        url_path=path,
     )
 
 
