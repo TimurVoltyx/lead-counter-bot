@@ -2,6 +2,8 @@ import os
 import logging
 import random
 import asyncio
+import re
+import unicodedata
 from datetime import datetime, timedelta, timezone, time as dtime
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
@@ -63,22 +65,40 @@ DISPLAY = {
 }
 ORDER = ["angi", "yelp", "local", "website", "thumbtack"]
 
+def norm_text(text: str) -> str:
+    """Нормализация: NFKC, убираем неразрывные пробелы, к нижнему регистру."""
+    if not text:
+        return ""
+    t = unicodedata.normalize("NFKC", text)
+    t = t.replace("\u00A0", " ")
+    return t.casefold()
+
 def classify_source(text: str) -> str | None:
     if not text:
         return None
-    t = text.lower()
+    t = norm_text(text)
 
-    # Thumbtack (ловит и "LEAD from Thumbtack", и любые варианты с "thumbtack")
+    # WEBSITE — ловим 'website', 'main page', допускаем варианты
+    if ("website" in t) or ("main page" in t) or re.search(r"\bweb\s?site\b", t):
+        return "website"
+
+    # LOCAL — допускаем разные пробелы/эмодзи между словами
+    if re.search(r"lead\s+from\s+local", t):
+        return "local"
+    if "local" in t and "lead" in t:
+        return "local"
+
+    # Yelp
+    if re.search(r"lead\s+from\s+yelp", t) or "yelp" in t:
+        return "yelp"
+
+    # Angi
+    if "angi" in t or "angi.com" in t or "voltyx lead" in t:
+        return "angi"
+
+    # Thumbtack (в т.ч. 'LEAD from Thumbtack')
     if "lead from thumbtack" in t or "thumbtack" in t or "thumbtack.com" in t:
         return "thumbtack"
-    if "angi" in t or "voltyx lead" in t or "angi.com" in t:
-        return "angi"
-    if "lead from yelp" in t or "yelp" in t:
-        return "yelp"
-    if "lead from local" in t:
-        return "local"
-    if "website" in t or "check website" in t:
-        return "website"
 
     return None
 
@@ -188,7 +208,7 @@ async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
     deleted = await db_clean_last_hours(CLEAN_WINDOW_HOURS)
     await update.effective_message.reply_text(f"🧹 Cleared {deleted} rows from the last {CLEAN_WINDOW_HOURS} hours.")
 
-# NEW: /- — удалить последний лид
+# /undo и "/-" — удалить последний лид
 async def cmd_remove_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat or update.effective_chat.id != CHAT_ID:
         return
@@ -210,7 +230,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat or chat.id != CHAT_ID or not msg:
         return
 
-    # ВАЖНО: берём и текст, и подпись (Thumbtack часто приходит как caption)
+    # Учитываем и текст, и подписи к медиа
     content = (msg.text or msg.caption or "").strip()
     if not content:
         return
@@ -269,9 +289,12 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("ping",    cmd_ping,    filters=filters.Chat(CHAT_ID)))
     app.add_handler(CommandHandler("summary", cmd_summary, filters=filters.Chat(CHAT_ID)))
     app.add_handler(CommandHandler("clean",   cmd_clean,   filters=filters.Chat(CHAT_ID)))
-    app.add_handler(CommandHandler("-",       cmd_remove_last, filters=filters.Chat(CHAT_ID)))  # NEW
+    app.add_handler(CommandHandler("undo",    cmd_remove_last, filters=filters.Chat(CHAT_ID)))  # официальная команда
 
-    # Сообщения с лидами: учитываем и TEXT, и CAPTION
+    # Дополнительно ловим именно строку "/-" (через Regex)
+    app.add_handler(MessageHandler(filters.Chat(CHAT_ID) & filters.Regex(r"^/\-$"), cmd_remove_last))
+
+    # Сообщения с лидами: TEXT и CAPTION
     app.add_handler(MessageHandler(filters.Chat(CHAT_ID) & (filters.TEXT | filters.CAPTION), handle_message))
 
     # Планировщик авто‑сводок (тайзона задаётся прямо в time)
