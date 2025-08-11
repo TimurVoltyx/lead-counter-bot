@@ -66,38 +66,46 @@ DISPLAY = {
 ORDER = ["angi", "yelp", "local", "website", "thumbtack"]
 
 def norm_text(text: str) -> str:
-    """Нормализация: NFKC, убираем неразрывные пробелы, к нижнему регистру."""
+    """Мягкая нормализация: NFKC, NBSP -> space, lower."""
     if not text:
         return ""
     t = unicodedata.normalize("NFKC", text)
     t = t.replace("\u00A0", " ")
     return t.casefold()
 
-def classify_source(text: str) -> str | None:
-    if not text:
-        return None
+def alpha_only(text: str) -> str:
+    """Жёсткая нормализация: оставляем только латинские буквы -> пробелы, сжимаем."""
     t = norm_text(text)
+    # всё не a-z -> пробел
+    t = re.sub(r"[^a-z]+", " ", t)
+    # сжать пробелы
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
-    # WEBSITE — ловим 'website', 'main page', допускаем варианты
-    if ("website" in t) or ("main page" in t) or re.search(r"\bweb\s?site\b", t):
+def classify_source(raw: str) -> str | None:
+    if not raw:
+        return None
+    t_soft = norm_text(raw)
+    t = alpha_only(raw)
+
+    # WEBSITE: ловим 'website', 'main page', и близкие варианты
+    if "website" in t or "main page" in t or "web site" in t:
         return "website"
 
-    # LOCAL — допускаем разные пробелы/эмодзи между словами
-    if re.search(r"lead\s+from\s+local", t):
-        return "local"
-    if "local" in t and "lead" in t:
+    # LOCAL: любые пробелы/эмодзи/скобки не мешают
+    if "lead from local" in t or ("local" in t and "lead" in t):
         return "local"
 
     # Yelp
-    if re.search(r"lead\s+from\s+yelp", t) or "yelp" in t:
+    if "lead from yelp" in t or "yelp" in t:
         return "yelp"
 
     # Angi
-    if "angi" in t or "angi.com" in t or "voltyx lead" in t:
+    if "angi" in t or "angi com" in t or "voltyx lead" in t_soft:
         return "angi"
 
-    # Thumbtack (в т.ч. 'LEAD from Thumbtack')
-    if "lead from thumbtack" in t or "thumbtack" in t or "thumbtack.com" in t:
+    # Thumbtack — ВАЖНО: (LEAD from Thumbtack) тоже ловим
+    if "lead from thumbtack" in t or "thumbtack" in t or "thumbtack com" in t:
         return "thumbtack"
 
     return None
@@ -290,8 +298,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("summary", cmd_summary, filters=filters.Chat(CHAT_ID)))
     app.add_handler(CommandHandler("clean",   cmd_clean,   filters=filters.Chat(CHAT_ID)))
     app.add_handler(CommandHandler("undo",    cmd_remove_last, filters=filters.Chat(CHAT_ID)))  # официальная команда
-
-    # Дополнительно ловим именно строку "/-" (через Regex)
+    # Ловим именно строку "/-" (через Regex)
     app.add_handler(MessageHandler(filters.Chat(CHAT_ID) & filters.Regex(r"^/\-$"), cmd_remove_last))
 
     # Сообщения с лидами: TEXT и CAPTION
