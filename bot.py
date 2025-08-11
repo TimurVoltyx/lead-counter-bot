@@ -74,7 +74,11 @@ def classify_source(text: str) -> str | None:
         return "angi"
     if "lead from yelp" in t or "yelp" in t:
         return "yelp"
-    if "lead from local" in t:
+    if (
+        "lead from local" in t
+        or "lead from locel" in t
+        or "locel" in t
+    ):
         return "local"
     if "website" in t or "check website" in t:
         return "website"
