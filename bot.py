@@ -2,6 +2,8 @@ import os
 import logging
 import random
 import asyncio
+import re  # FIX: для гибких проверок
+import unicodedata  # FIX: нормализация текста
 from datetime import datetime, timedelta, timezone, time as dtime
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
@@ -63,21 +65,41 @@ DISPLAY = {
 }
 ORDER = ["angi", "yelp", "local", "website", "thumbtack"]
 
+# FIX: нормализация и более устойчивые проверки
+def norm_text(text: str) -> str:
+    """Нормализация: NFKC, убираем неразрывные пробелы, к нижнему регистру."""
+    if not text:
+        return ""
+    t = unicodedata.normalize("NFKC", text)
+    t = t.replace("\u00A0", " ")
+    return t.casefold()
+
 def classify_source(text: str) -> str | None:
     if not text:
         return None
-    t = text.lower()
+    t = norm_text(text)
 
+    # WEBSITE — ловим 'website', 'main page', допускаем эмодзи/лишние слова
+    if ("website" in t) or ("main page" in t) or re.search(r"\bweb\s?site\b", t):
+        return "website"
+
+    # LOCAL — допускаем разные пробелы/эмодзи между словами
+    if re.search(r"lead\s+from\s+local", t):
+        return "local"
+    if "local" in t and "lead" in t:
+        return "local"
+
+    # Yelp
+    if re.search(r"lead\s+from\s+yelp", t) or "yelp" in t:
+        return "yelp"
+
+    # Angi
+    if "angi" in t or "angi.com" in t or "voltyx lead" in t:
+        return "angi"
+
+    # Thumbtack
     if "thumbtack" in t or "thumbtack.com" in t or "lead from thumbtack" in t:
         return "thumbtack"
-    if "angi" in t or "voltyx lead" in t or "angi.com" in t:
-        return "angi"
-    if "lead from yelp" in t or "yelp" in t:
-        return "yelp"
-    if "lead from local" in t:
-        return "local"
-    if "website" in t or "check website" in t:
-        return "website"
 
     return None
 
@@ -190,10 +212,15 @@ async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     chat = update.effective_chat
-    if not chat or chat.id != CHAT_ID or not msg or not msg.text:
+    if not chat or chat.id != CHAT_ID or not msg:
         return
 
-    source = classify_source(msg.text)
+    # FIX: учитываем и текст, и подписи к медиа
+    content = (msg.text or msg.caption or "").strip()
+    if not content:
+        return
+
+    source = classify_source(content)
     if not source:
         return
 
@@ -248,8 +275,8 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("summary", cmd_summary, filters=filters.Chat(CHAT_ID)))
     app.add_handler(CommandHandler("clean",   cmd_clean,   filters=filters.Chat(CHAT_ID)))
 
-    # Сообщения с лидами
-    app.add_handler(MessageHandler(filters.Chat(CHAT_ID) & filters.TEXT, handle_message))
+    # Сообщения с лидами: теперь TEXT ИЛИ CAPTION
+    app.add_handler(MessageHandler(filters.Chat(CHAT_ID) & (filters.TEXT | filters.CAPTION), handle_message))
 
     # Планировщик авто‑сводок (тайзона задаётся прямо в time)
     jq = app.job_queue
